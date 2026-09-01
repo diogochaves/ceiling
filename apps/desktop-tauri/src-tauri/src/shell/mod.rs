@@ -12,6 +12,7 @@ mod geometry;
 mod position;
 pub mod settings_window;
 mod transition;
+pub(crate) mod webview_health;
 mod window;
 
 #[cfg(test)]

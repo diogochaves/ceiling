@@ -58,17 +58,25 @@ pub fn save_stored_size(width: u32, height: u32) {
 /// command, or `tauri::async_runtime::spawn`), never a sync command handler.
 pub fn open_or_focus(app: &AppHandle, position: Option<(i32, i32)>) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
-        if let Some((x, y)) = position {
-            let _ = window.set_position(PhysicalPosition::new(x, y));
-        } else {
-            reanchor(app)?;
+        if super::webview_health::webview_is_alive(&window) {
+            if let Some((x, y)) = position {
+                let _ = window.set_position(PhysicalPosition::new(x, y));
+            } else {
+                reanchor(app)?;
+            }
+            window.show().map_err(|e| e.to_string())?;
+            window.set_focus().map_err(|e| e.to_string())?;
+            if show_grace_starts_now(false) {
+                mark_shown(app);
+            }
+            return Ok(());
         }
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-        if show_grace_starts_now(false) {
-            mark_shown(app);
-        }
-        return Ok(());
+        // The WebView2 instance behind the hidden window is gone (#410).
+        // Showing it would paint an empty transparent frame with no way back
+        // short of restarting the app, so tear the shell down and rebuild it
+        // through the normal first-open path below.
+        tracing::warn!("flyout_window: rebuilding the flyout after its WebView2 instance was lost");
+        super::webview_health::destroy_and_release(app, &window)?;
     }
 
     let url = WebviewUrl::App("index.html?window=flyout".into());
@@ -128,7 +136,9 @@ fn arm_reveal(app: &AppHandle) -> Result<(), String> {
 /// Hide (never close) the flyout window. Hiding — rather than closing —
 /// keeps the window's WebView2 instance alive across opens, matching
 /// `settings_window::dismiss`'s rationale: closing risks Tauri's
-/// process/window lifecycle treating it as an app-relevant close.
+/// process/window lifecycle treating it as an app-relevant close. If that
+/// instance dies while hidden (#410), `open_or_focus` notices via
+/// `webview_health` and rebuilds the window instead of showing the husk.
 pub fn hide(app: &AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
         let state = app
