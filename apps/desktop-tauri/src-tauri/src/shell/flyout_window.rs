@@ -12,7 +12,7 @@
 //! `settings_window.rs`'s builder recipe (async open, manual DWM dark-caption
 //! pass, `WebviewUrl::App` with a `?window=` query marker).
 
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, PhysicalPosition, WebviewUrl};
@@ -38,6 +38,50 @@ const FLYOUT_SIZE_KEY: &str = "flyout";
 /// `was_tray_panel_recently_shown` guard for the old shared window.
 const RECENTLY_SHOWN_GRACE: Duration = Duration::from_millis(500);
 
+/// Serializes `open_or_focus`. The taskbar widget spawns one async open per
+/// hover-dwell and another per click, so a click landing while a hover-open
+/// is still building the window used to run a second, concurrent open —
+/// see `existing_window_action` for what that second open must not do.
+/// Same pattern as `shell::SHELL_TRANSITION_SERIAL`.
+static OPEN_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// How long an open leaves a freshly built window to the frontend's reveal
+/// before showing it anyway. The reveal normally lands within a few hundred
+/// milliseconds of `build()`; past this the frontend is assumed to have
+/// failed (render error, rejected command), and a blank-but-visible window
+/// the user can dismiss beats an invisible one nothing can open.
+const REVEAL_GRACE: Duration = Duration::from_millis(1500);
+
+/// What `open_or_focus` does with a flyout window that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingWindowAction {
+    /// Healthy, already revealed at least once (or the reveal is overdue):
+    /// reposition, show, focus.
+    Show,
+    /// Built but not yet revealed by the frontend's first layout pass.
+    /// Showing it now would paint the pre-measure blank frame the
+    /// `.visible(false)` + `reveal_tray_panel_window` handshake exists to
+    /// prevent, so leave it to the pending reveal.
+    AwaitReveal,
+    /// Its WebView2 instance is gone (#410): destroy and rebuild.
+    Rebuild,
+}
+
+/// `reveal_pending_for` is how long the window's first reveal has been
+/// outstanding, or `None` once it has happened (or was never armed).
+fn existing_window_action(
+    alive: bool,
+    reveal_pending_for: Option<Duration>,
+) -> ExistingWindowAction {
+    if !alive {
+        ExistingWindowAction::Rebuild
+    } else if reveal_pending_for.is_some_and(|waited| waited < REVEAL_GRACE) {
+        ExistingWindowAction::AwaitReveal
+    } else {
+        ExistingWindowAction::Show
+    }
+}
+
 /// Read the remembered flyout size, if any (migrating a legacy
 /// `"trayPanel"`-keyed size on first read — see `geometry_store::load_size`).
 pub fn stored_size() -> Option<(u32, u32)> {
@@ -57,26 +101,57 @@ pub fn save_stored_size(width: u32, height: u32) {
 /// precedent) — callers must invoke this from an async context (an `async`
 /// command, or `tauri::async_runtime::spawn`), never a sync command handler.
 pub fn open_or_focus(app: &AppHandle, position: Option<(i32, i32)>) -> Result<(), String> {
+    // Held across the whole open, including the blocking `build()`, so a
+    // second caller waits for the first build to finish and then sees the
+    // window with its reveal still pending instead of racing it.
+    let _open_guard = OPEN_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
-        if super::webview_health::webview_is_alive(&window) {
-            if let Some((x, y)) = position {
-                let _ = window.set_position(PhysicalPosition::new(x, y));
-            } else {
-                reanchor(app)?;
+        let alive = super::webview_health::webview_is_alive(&window);
+        let reveal_pending_for = reveal_pending_for(app);
+        match existing_window_action(alive, reveal_pending_for) {
+            ExistingWindowAction::Show => {
+                if let Some(waited) = reveal_pending_for {
+                    // The frontend never revealed the window it was handed.
+                    // Show it anyway so the user is not locked out; a blank
+                    // panel they can dismiss beats an invisible one.
+                    tracing::warn!(
+                        waited_ms = waited.as_millis(),
+                        "flyout_window: first reveal never arrived; showing the window anyway"
+                    );
+                    clear_reveal(app);
+                }
+                if let Some((x, y)) = position {
+                    let _ = window.set_position(PhysicalPosition::new(x, y));
+                } else {
+                    reanchor(app)?;
+                }
+                window.show().map_err(|e| e.to_string())?;
+                window.set_focus().map_err(|e| e.to_string())?;
+                if show_grace_starts_now(false) {
+                    mark_shown(app);
+                }
+                return Ok(());
             }
-            window.show().map_err(|e| e.to_string())?;
-            window.set_focus().map_err(|e| e.to_string())?;
-            if show_grace_starts_now(false) {
-                mark_shown(app);
+            ExistingWindowAction::AwaitReveal => {
+                tracing::debug!(
+                    "flyout_window: open requested while the first reveal is pending; leaving it to the frontend"
+                );
+                return Ok(());
             }
-            return Ok(());
+            ExistingWindowAction::Rebuild => {
+                // The WebView2 instance behind the hidden window is gone (#410).
+                // Showing it would paint an empty transparent frame with no way
+                // back short of restarting the app, so tear the shell down and
+                // rebuild it through the normal first-open path below.
+                tracing::warn!(
+                    "flyout_window: rebuilding the flyout after its WebView2 instance was lost"
+                );
+                super::webview_health::destroy_and_release(app, &window)?;
+            }
         }
-        // The WebView2 instance behind the hidden window is gone (#410).
-        // Showing it would paint an empty transparent frame with no way back
-        // short of restarting the app, so tear the shell down and rebuild it
-        // through the normal first-open path below.
-        tracing::warn!("flyout_window: rebuilding the flyout after its WebView2 instance was lost");
-        super::webview_health::destroy_and_release(app, &window)?;
     }
 
     let url = WebviewUrl::App("index.html?window=flyout".into());
@@ -101,7 +176,20 @@ pub fn open_or_focus(app: &AppHandle, position: Option<(i32, i32)>) -> Result<()
         // disabled explicitly on every window that hosts that grid.
         .disable_drag_drop_handler()
         .visible(false);
-    let win = builder.build().map_err(|e| e.to_string())?;
+
+    // Armed BEFORE `build()`: the page starts loading on the browser process
+    // the moment the controller exists, and its reveal can reach
+    // `reveal_tray_panel_window` before `build()` has even returned to this
+    // thread. Arming afterwards would drop that reveal and leave the flag set
+    // with nothing left to consume it.
+    arm_reveal(app)?;
+    let win = match builder.build() {
+        Ok(win) => win,
+        Err(error) => {
+            clear_reveal(app);
+            return Err(error.to_string());
+        }
+    };
     super::webview_lifecycle::watch(app, &win);
 
     super::dwm::force_dark_caption(&win);
@@ -118,7 +206,6 @@ pub fn open_or_focus(app: &AppHandle, position: Option<(i32, i32)>) -> Result<()
     if show_grace_starts_now(true) {
         mark_shown(app);
     }
-    arm_reveal(app)?;
     Ok(())
 }
 
@@ -126,11 +213,31 @@ fn show_grace_starts_now(first_build_hidden: bool) -> bool {
     !first_build_hidden
 }
 
+/// How long the window's first reveal has been outstanding, or `None` when
+/// none is pending. Missing or poisoned state reads as "not pending", which
+/// routes the open to `Show` — the pre-existing behaviour — rather than
+/// leaving the window invisible.
+fn reveal_pending_for(app: &AppHandle) -> Option<Duration> {
+    app.try_state::<Mutex<AppState>>()
+        .and_then(|state| state.lock().ok()?.flyout_reveal_pending_for(Instant::now()))
+}
+
+fn clear_reveal(app: &AppHandle) {
+    if let Some(st) = app.try_state::<Mutex<AppState>>()
+        && let Ok(mut guard) = st.lock()
+    {
+        guard.clear_flyout_reveal();
+    }
+}
+
 fn arm_reveal(app: &AppHandle) -> Result<(), String> {
     let state = app
         .try_state::<Mutex<AppState>>()
         .ok_or_else(|| "app state unavailable".to_string())?;
-    state.lock().map_err(|e| e.to_string())?.arm_flyout_reveal();
+    state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .arm_flyout_reveal(Instant::now());
     Ok(())
 }
 
@@ -345,5 +452,51 @@ mod tests {
     fn first_hidden_build_does_not_start_show_grace() {
         assert!(show_grace_starts_now(false));
         assert!(!show_grace_starts_now(true));
+    }
+
+    #[test]
+    fn a_revealed_healthy_window_is_simply_shown() {
+        assert_eq!(
+            existing_window_action(true, None),
+            ExistingWindowAction::Show
+        );
+    }
+
+    #[test]
+    fn an_open_during_a_pending_reveal_waits_for_the_frontend() {
+        // The hover/click race from #410 (finding A): the window exists but
+        // is still `.visible(false)` awaiting `reveal_tray_panel_window`.
+        // Showing it here would bypass the handshake and flash a blank frame.
+        assert_eq!(
+            existing_window_action(true, Some(Duration::from_millis(200))),
+            ExistingWindowAction::AwaitReveal
+        );
+    }
+
+    #[test]
+    fn an_overdue_reveal_stops_blocking_opens() {
+        // If the frontend never reveals (render error, rejected command), a
+        // no-op open forever would leave the flyout unopenable until restart —
+        // the very symptom #410 is about. Past the grace, show it anyway.
+        assert_eq!(
+            existing_window_action(true, Some(REVEAL_GRACE)),
+            ExistingWindowAction::Show
+        );
+        assert_eq!(
+            existing_window_action(true, Some(Duration::from_secs(30))),
+            ExistingWindowAction::Show
+        );
+    }
+
+    #[test]
+    fn a_dead_webview_is_rebuilt_regardless_of_reveal_state() {
+        assert_eq!(
+            existing_window_action(false, None),
+            ExistingWindowAction::Rebuild
+        );
+        assert_eq!(
+            existing_window_action(false, Some(Duration::from_millis(1))),
+            ExistingWindowAction::Rebuild
+        );
     }
 }
