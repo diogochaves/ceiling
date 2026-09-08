@@ -5,7 +5,7 @@ use tauri::{Emitter, Manager, PhysicalPosition, WebviewUrl};
 
 use crate::surface::SurfaceMode;
 
-const SETTINGS_LABEL: &str = "settings";
+pub(crate) const SETTINGS_LABEL: &str = "settings";
 const SETTINGS_WIDTH: f64 = 720.0;
 const SETTINGS_HEIGHT: f64 = 580.0;
 
@@ -15,6 +15,12 @@ const SETTINGS_HEIGHT: f64 = 580.0;
 /// frontend can switch to the requested tab without a full reload.
 pub fn open_or_focus(app: &tauri::AppHandle, tab: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(SETTINGS_LABEL) {
+        // The WebView2 instance behind the hidden window may be gone (#410);
+        // showing it then paints an empty frame. The guard dispatches a
+        // rebuild that re-enters this function once the label is free.
+        if !super::window_recovery::settings_window_is_usable(app, &window, tab) {
+            return Ok(());
+        }
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
         app.emit_to(SETTINGS_LABEL, "settings-change-tab", tab)

@@ -269,9 +269,13 @@ where
     P: FnOnce(SurfaceMode) -> bool,
 {
     let _transition_guard = SHELL_TRANSITION_SERIAL.lock().unwrap();
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window unavailable".to_string())?;
+    // Hiding a dead window is harmless, but this path can also transition
+    // `main` to another visible mode. No request is replayed: the user asked
+    // to put the window away, so recovering it silently in the background is
+    // the whole job (#410).
+    let Some(window) = super::window_recovery::resolve_live_main(app, None) else {
+        return Ok(Some(SurfaceMode::Hidden));
+    };
     let st = app
         .try_state::<Mutex<AppState>>()
         .ok_or_else(|| "app state unavailable".to_string())?;
