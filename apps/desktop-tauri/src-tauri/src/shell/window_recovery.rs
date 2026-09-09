@@ -246,14 +246,16 @@ fn dispatch_settings_rebuild(app: &AppHandle, tab: &str) {
         SETTINGS_REBUILD_IN_FLIGHT.store(false, Ordering::SeqCst);
 
         match destroyed {
-            Ok(()) => {
-                if let Err(error) = super::settings_window::open_or_focus(&app, &tab) {
-                    tracing::warn!(
-                        %error,
-                        "window_recovery: reopening Settings after rebuild failed"
-                    );
-                }
-            }
+            Ok(()) => match super::settings_window::open_or_focus(&app, &tab) {
+                Ok(()) => tracing::info!(
+                    label = super::settings_window::SETTINGS_LABEL,
+                    "window_recovery: settings window rebuilt"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "window_recovery: reopening Settings after rebuild failed"
+                ),
+            },
             Err(error) => tracing::error!(
                 %error,
                 "window_recovery: could not release the settings window for rebuild"
