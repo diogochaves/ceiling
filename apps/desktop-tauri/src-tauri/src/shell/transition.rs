@@ -258,6 +258,7 @@ fn apply_transition_request(
             mode: request.mode,
             target: request.target.clone(),
             position: request.position,
+            reopen: force_same_mode_apply,
         }),
     ) else {
         return Ok(SurfaceMode::Hidden);

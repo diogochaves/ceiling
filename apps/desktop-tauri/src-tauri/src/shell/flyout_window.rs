@@ -102,6 +102,7 @@ pub fn open_or_focus(app: &AppHandle, position: Option<(i32, i32)>) -> Result<()
         .disable_drag_drop_handler()
         .visible(false);
     let win = builder.build().map_err(|e| e.to_string())?;
+    super::webview_lifecycle::watch(app, &win);
 
     super::dwm::force_dark_caption(&win);
 
@@ -141,6 +142,10 @@ fn arm_reveal(app: &AppHandle) -> Result<(), String> {
 /// `webview_health` and rebuilds the window instead of showing the husk.
 pub fn hide(app: &AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
+        tracing::debug!(
+            visible = window.is_visible().unwrap_or(false),
+            "flyout_window: hiding the flyout and clearing any pending reveal"
+        );
         let state = app
             .try_state::<Mutex<AppState>>()
             .ok_or_else(|| "app state unavailable".to_string())?;
@@ -180,6 +185,15 @@ pub fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) -
     match event {
         tauri::WindowEvent::Focused(false) => {
             if crate::proof_harness::is_proof_mode(app) {
+                return true;
+            }
+            // A window that has never been shown cannot lose focus in any
+            // sense the user meant. Windows still reports one when a hidden
+            // window is activated without foreground rights (e.g. right after
+            // build, before the frontend's reveal); treating that as a
+            // dismiss would clear the pending reveal and leave the flyout
+            // invisible.
+            if !window.is_visible().unwrap_or(true) {
                 return true;
             }
             let Some(st) = app.try_state::<Mutex<AppState>>() else {

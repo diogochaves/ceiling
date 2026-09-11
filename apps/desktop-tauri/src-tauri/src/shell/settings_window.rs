@@ -47,6 +47,7 @@ pub fn open_or_focus(app: &tauri::AppHandle, tab: &str) -> Result<(), String> {
         .resizable(true)
         .build()
         .map_err(|e| e.to_string())?;
+    super::webview_lifecycle::watch(app, &win);
 
     // Force DWM caption to dark; keep WS_THICKFRAME since window is resizable
     super::dwm::force_dark_caption_resizable(&win);

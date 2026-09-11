@@ -253,6 +253,7 @@ fn main() {
                 }
             }
             if let Some(window) = app.get_webview_window("main") {
+                shell::webview_lifecycle::watch(app.handle(), &window);
                 shell::dwm::force_dark_caption(&window);
                 window.hide()?;
             }

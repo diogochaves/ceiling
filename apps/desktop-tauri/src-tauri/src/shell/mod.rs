@@ -13,6 +13,7 @@ mod position;
 pub mod settings_window;
 mod transition;
 pub(crate) mod webview_health;
+pub(crate) mod webview_lifecycle;
 mod window;
 pub(crate) mod window_recovery;
 
